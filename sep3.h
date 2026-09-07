@@ -89,7 +89,9 @@ typedef void (*Sep3RequestCallback)(
  * The frame remains valid until sep3__handle_transmitted() is called for
  * slot_id. Return 0 when the frame was accepted, ER_AGAIN when the transport is
  * temporarily busy, or another ErrorCodes value on failure. The callback must
- * not call sep3__handle_transmitted() before returning.
+ * not call sep3__handle_transmitted() before returning. For every accepted
+ * frame, the transport must call sep3__handle_transmitted() exactly once and
+ * only after it no longer accesses the frame buffer.
  */
 typedef int (*Sep3TransmitHandler)(
     struct Sep3 *self,

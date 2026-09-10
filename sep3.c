@@ -1,5 +1,6 @@
 #include "sep3.h"
 
+#include <crc32.h>
 #include <string.h>
 
 enum {
@@ -7,8 +8,8 @@ enum {
     SEP3_TRANSACTION_ID_OFFSET = 1,
     SEP3_DATA_ID_OFFSET = 3,
     SEP3_PAYLOAD_OFFSET = 4,
-    SEP3_CHECKSUM_SIZE = 2,
-    SEP3_MIN_PACKET_SIZE = 6,
+    SEP3_CHECKSUM_SIZE = 4,
+    SEP3_MIN_PACKET_SIZE = SEP3_PACKET_OVERHEAD_SIZE,
     SEP3_RESERVED_DATA_ID_START = 0xF0,
     SEP3_FRAMER_START = 0xD4,
     SEP3_FRAMER_END = 0x81,
@@ -23,24 +24,6 @@ enum {
     SEP3_TX_PURPOSE_TRANSIENT_ANSWER = 4,
 };
 
-static uint16_t sep3__crc16(uint8_t const *data, uint16_t data_size)
-{
-    uint16_t crc = 0xFFFF;
-
-    for (uint16_t i = 0; i < data_size; ++i) {
-        crc ^= (uint16_t)data[i] << 8;
-        for (uint8_t bit = 0; bit < 8; ++bit) {
-            if (0 != (crc & 0x8000)) {
-                crc = (uint16_t)((crc << 1) ^ 0x1021);
-            } else {
-                crc <<= 1;
-            }
-        }
-    }
-
-    return crc;
-}
-
 static TransactionId sep3__read_u16_le(uint8_t const *data)
 {
     return (TransactionId)((TransactionId)data[0] | ((TransactionId)data[1] << 8));
@@ -50,6 +33,41 @@ static void sep3__write_u16_le(uint8_t *data, uint16_t value)
 {
     data[0] = (uint8_t)value;
     data[1] = (uint8_t)(value >> 8);
+}
+
+static uint32_t sep3__read_u32_le(uint8_t const *data)
+{
+    return (uint32_t)data[0] |
+        ((uint32_t)data[1] << 8) |
+        ((uint32_t)data[2] << 16) |
+        ((uint32_t)data[3] << 24);
+}
+
+static void sep3__write_u32_le(uint8_t *data, uint32_t value)
+{
+    data[0] = (uint8_t)value;
+    data[1] = (uint8_t)(value >> 8);
+    data[2] = (uint8_t)(value >> 16);
+    data[3] = (uint8_t)(value >> 24);
+}
+
+static void sep3__write_packet_header(
+    uint8_t *packet,
+    Sep3PacketType type,
+    TransactionId transaction_id,
+    DataId data_id)
+{
+    packet[SEP3_TYPE_OFFSET] = (uint8_t)type;
+    sep3__write_u16_le(&packet[SEP3_TRANSACTION_ID_OFFSET], transaction_id);
+    packet[SEP3_DATA_ID_OFFSET] = data_id;
+}
+
+static void sep3__finalize_packet(uint8_t *packet, uint16_t size, uint16_t *packet_size)
+{
+    uint32_t const crc = crc32__ieee(packet, (size_t)(size - SEP3_CHECKSUM_SIZE));
+
+    sep3__write_u32_le(&packet[size - SEP3_CHECKSUM_SIZE], crc);
+    *packet_size = size;
 }
 
 static bool sep3__is_packet_type(uint8_t type)
@@ -78,7 +96,6 @@ static int sep3__build_packet(
     uint16_t *packet_size)
 {
     uint16_t size = 0;
-    uint16_t crc = 0;
 
     if ((NULL == packet) || (NULL == packet_size)) {
         return ER_INVAL;
@@ -91,30 +108,25 @@ static int sep3__build_packet(
     }
 
     size = (uint16_t)(SEP3_MIN_PACKET_SIZE + payload_size);
-    packet[SEP3_TYPE_OFFSET] = (uint8_t)type;
-    sep3__write_u16_le(&packet[SEP3_TRANSACTION_ID_OFFSET], transaction_id);
-    packet[SEP3_DATA_ID_OFFSET] = data_id;
+    sep3__write_packet_header(packet, type, transaction_id, data_id);
     if (0 != payload_size) {
         memcpy(&packet[SEP3_PAYLOAD_OFFSET], payload, payload_size);
     }
-
-    crc = sep3__crc16(packet, (uint16_t)(size - SEP3_CHECKSUM_SIZE));
-    sep3__write_u16_le(&packet[size - SEP3_CHECKSUM_SIZE], crc);
-    *packet_size = size;
+    sep3__finalize_packet(packet, size, packet_size);
     return 0;
 }
 
 static bool sep3__packet_crc_is_valid(uint8_t const *packet, uint16_t packet_size)
 {
-    uint16_t expected = 0;
-    uint16_t actual = 0;
+    uint32_t expected = 0;
+    uint32_t actual = 0;
 
     if ((NULL == packet) || (packet_size < SEP3_MIN_PACKET_SIZE)) {
         return false;
     }
 
-    expected = sep3__read_u16_le(&packet[packet_size - SEP3_CHECKSUM_SIZE]);
-    actual = sep3__crc16(packet, (uint16_t)(packet_size - SEP3_CHECKSUM_SIZE));
+    expected = sep3__read_u32_le(&packet[packet_size - SEP3_CHECKSUM_SIZE]);
+    actual = crc32__ieee(packet, (size_t)(packet_size - SEP3_CHECKSUM_SIZE));
     return expected == actual;
 }
 
@@ -161,7 +173,6 @@ static struct Sep3Endpoint *sep3__get_or_create_endpoint(struct Sep3 *self, Data
             memset(endpoint, 0, sizeof(*endpoint));
             endpoint->is_used = true;
             endpoint->data_id = data_id;
-            ++self->endpoint_count;
             return endpoint;
         }
     }
@@ -192,6 +203,16 @@ static void sep3__pop_tx_slot(struct Sep3 *self)
     memset(slot, 0, sizeof(*slot));
     self->tx_head = (uint8_t)((self->tx_head + 1U) % SEP3_TX_SLOT_COUNT);
     --self->tx_count;
+}
+
+static struct Sep3TxSlot *sep3__reserve_tx_slot(struct Sep3 *self, uint8_t *slot_id)
+{
+    if ((NULL == slot_id) || (self->tx_count >= SEP3_TX_SLOT_COUNT)) {
+        return NULL;
+    }
+
+    *slot_id = (uint8_t)((self->tx_head + self->tx_count) % SEP3_TX_SLOT_COUNT);
+    return &self->buffers->tx[*slot_id];
 }
 
 static int sep3__try_submit_tx(struct Sep3 *self, bool notify_failure)
@@ -237,30 +258,19 @@ static int sep3__try_submit_tx(struct Sep3 *self, bool notify_failure)
     return rc;
 }
 
-static int sep3__queue_packet(
+static int sep3__commit_tx_slot(
     struct Sep3 *self,
-    uint8_t const *packet,
+    struct Sep3TxSlot *slot,
     uint16_t packet_size,
     uint8_t purpose,
     uint32_t generation,
     bool notify_failure)
 {
-    uint8_t slot_id = 0;
-    struct Sep3TxSlot *slot = NULL;
-    int frame_size = 0;
-    int rc = 0;
-
-    if (self->tx_count >= SEP3_TX_SLOT_COUNT) {
-        return ER_AGAIN;
-    }
-
-    slot_id = (uint8_t)((self->tx_head + self->tx_count) % SEP3_TX_SLOT_COUNT);
-    slot = &self->buffers->tx[slot_id];
-    memcpy(slot->data, packet, packet_size);
-    frame_size = framer7b__encode_in_place(
+    int const frame_size = framer7b__encode_in_place(
         slot->data,
         packet_size,
         (uint16_t)sizeof(slot->data));
+
     if (frame_size < 0) {
         memset(slot, 0, sizeof(*slot));
         return frame_size;
@@ -272,8 +282,27 @@ static int sep3__queue_packet(
     slot->state = SEP3_TX_QUEUED;
     ++self->tx_count;
 
-    rc = sep3__try_submit_tx(self, notify_failure);
-    return rc;
+    return sep3__try_submit_tx(self, notify_failure);
+}
+
+static int sep3__queue_packet(
+    struct Sep3 *self,
+    uint8_t const *packet,
+    uint16_t packet_size,
+    uint8_t purpose,
+    uint32_t generation,
+    bool notify_failure)
+{
+    uint8_t slot_id = 0;
+    struct Sep3TxSlot *slot = NULL;
+
+    slot = sep3__reserve_tx_slot(self, &slot_id);
+    if (NULL == slot) {
+        return ER_AGAIN;
+    }
+
+    memcpy(slot->data, packet, packet_size);
+    return sep3__commit_tx_slot(self, slot, packet_size, purpose, generation, notify_failure);
 }
 
 static int sep3__queue_incoming_answer(struct Sep3 *self)
@@ -313,6 +342,20 @@ static bool sep3__token_is_valid(
         (token->request_type == self->incoming.request_type);
 }
 
+static int sep3__commit_incoming_answer(struct Sep3 *self)
+{
+    int rc = 0;
+
+    self->incoming.active = false;
+    self->incoming.has_answer = true;
+    self->incoming.answer_pending = true;
+    rc = sep3__queue_incoming_answer(self);
+    if (ER_AGAIN == rc) {
+        return 0;
+    }
+    return rc;
+}
+
 static int sep3__set_incoming_answer(
     struct Sep3 *self,
     struct Sep3RequestToken const *token,
@@ -337,14 +380,7 @@ static int sep3__set_incoming_answer(
         return rc;
     }
 
-    self->incoming.active = false;
-    self->incoming.has_answer = true;
-    self->incoming.answer_pending = true;
-    rc = sep3__queue_incoming_answer(self);
-    if (ER_AGAIN == rc) {
-        return 0;
-    }
-    return rc;
+    return sep3__commit_incoming_answer(self);
 }
 
 static int sep3__send_protocol_error_for_incoming(
@@ -371,22 +407,44 @@ static int sep3__send_protocol_error_for_incoming(
 
 static int sep3__queue_transient_answer(struct Sep3 *self)
 {
+    uint8_t slot_id = 0;
+    struct Sep3TxSlot *slot = NULL;
+    uint8_t payload = 0;
+    uint16_t packet_size = 0;
     int rc = 0;
 
-    if (!self->transient_answer_pending) {
+    if (!self->transient_error_pending) {
         return 0;
     }
-    rc = sep3__queue_packet(
+
+    slot = sep3__reserve_tx_slot(self, &slot_id);
+    if (NULL == slot) {
+        return ER_AGAIN;
+    }
+
+    payload = (uint8_t)self->transient_error;
+    rc = sep3__build_packet(
+        slot->data,
+        SEP3_PACKET_PROTO_ERROR_ANSWER,
+        self->transient_transaction_id,
+        self->transient_data_id,
+        &payload,
+        1,
+        &packet_size);
+    if (0 != rc) {
+        self->transient_error_pending = false;
+        return rc;
+    }
+
+    rc = sep3__commit_tx_slot(
         self,
-        self->buffers->transient_answer,
-        self->transient_answer_size,
+        slot,
+        packet_size,
         SEP3_TX_PURPOSE_TRANSIENT_ANSWER,
         0,
         true);
-    if (0 == rc) {
-        self->transient_answer_pending = false;
-    } else if (ER_AGAIN != rc) {
-        self->transient_answer_pending = false;
+    if (ER_AGAIN != rc) {
+        self->transient_error_pending = false;
     }
     return rc;
 }
@@ -397,22 +455,15 @@ static void sep3__queue_transient_protocol_error(
     DataId data_id,
     Sep3ProtocolError error)
 {
-    uint8_t payload = (uint8_t)error;
-
-    if (self->transient_answer_pending) {
+    if (self->transient_error_pending) {
         return;
     }
-    if (0 == sep3__build_packet(
-            self->buffers->transient_answer,
-            SEP3_PACKET_PROTO_ERROR_ANSWER,
-            transaction_id,
-            data_id,
-            &payload,
-            1,
-            &self->transient_answer_size)) {
-        self->transient_answer_pending = true;
-        (void)sep3__queue_transient_answer(self);
-    }
+
+    self->transient_transaction_id = transaction_id;
+    self->transient_data_id = data_id;
+    self->transient_error = error;
+    self->transient_error_pending = true;
+    (void)sep3__queue_transient_answer(self);
 }
 
 static void sep3__dispatch_incoming(struct Sep3 *self, uint8_t const *packet, uint16_t packet_size)
@@ -423,6 +474,7 @@ static void sep3__dispatch_incoming(struct Sep3 *self, uint8_t const *packet, ui
     uint16_t payload_size = (uint16_t)(packet_size - SEP3_MIN_PACKET_SIZE);
     uint8_t const *payload = &packet[SEP3_PAYLOAD_OFFSET];
     struct Sep3Endpoint *endpoint = NULL;
+    uint32_t incoming_timeout_ms = 1U;
 
     if (SEP3_PACKET_WRITE_NO_ANSWER == type) {
         if (0 != transaction_id) {
@@ -463,6 +515,7 @@ static void sep3__dispatch_incoming(struct Sep3 *self, uint8_t const *packet, ui
         self->incoming.transaction_id = transaction_id;
         self->incoming.data_id = data_id;
         self->incoming.generation = self->token_generation;
+        self->incoming.timeout_ms = 1U;
         (void)sep3__send_protocol_error_for_incoming(
             self,
             SEP3_PROTOCOL_ERROR_INVALID_TRANSACTION_ID);
@@ -470,8 +523,10 @@ static void sep3__dispatch_incoming(struct Sep3 *self, uint8_t const *packet, ui
     }
 
     if (self->incoming.valid && (self->incoming.transaction_id == transaction_id)) {
-        bool same_request = (self->incoming.request_size == packet_size) &&
-            (0 == memcmp(self->buffers->incoming_request, packet, packet_size));
+        bool same_request = (self->incoming.request_type == type) &&
+            (self->incoming.data_id == data_id) &&
+            (self->incoming.request_size == packet_size) &&
+            (self->incoming.payload_hash == crc32__ieee(payload, (size_t)payload_size));
         if (!same_request) {
             sep3__queue_transient_protocol_error(
                 self,
@@ -503,7 +558,16 @@ static void sep3__dispatch_incoming(struct Sep3 *self, uint8_t const *packet, ui
         return;
     }
 
-    memcpy(self->buffers->incoming_request, packet, packet_size);
+    endpoint = sep3__find_endpoint(self, data_id);
+    if ((SEP3_PACKET_READ == type) && (NULL != endpoint) && (NULL != endpoint->on_read)) {
+        incoming_timeout_ms = endpoint->read_timeout_ms;
+    } else if ((SEP3_PACKET_WRITE == type) &&
+        (NULL != endpoint) &&
+        (NULL != endpoint->on_write)) {
+        incoming_timeout_ms = endpoint->write_timeout_ms;
+    }
+
+    self->incoming.payload_hash = crc32__ieee(payload, (size_t)payload_size);
     ++self->token_generation;
     if (0 == self->token_generation) {
         ++self->token_generation;
@@ -518,6 +582,7 @@ static void sep3__dispatch_incoming(struct Sep3 *self, uint8_t const *packet, ui
     self->incoming.request_size = packet_size;
     self->incoming.answer_size = 0;
     self->incoming.generation = self->token_generation;
+    self->incoming.timeout_ms = incoming_timeout_ms;
     self->incoming.started_ms = self->now_ms;
 
     if ((SEP3_PACKET_READ == type) && (0 != payload_size)) {
@@ -527,7 +592,6 @@ static void sep3__dispatch_incoming(struct Sep3 *self, uint8_t const *packet, ui
         return;
     }
 
-    endpoint = sep3__find_endpoint(self, data_id);
     if ((SEP3_PACKET_READ == type) && (NULL != endpoint) && (NULL != endpoint->on_read)) {
         struct Sep3RequestToken token = {
             .owner = self,
@@ -552,7 +616,7 @@ static void sep3__dispatch_incoming(struct Sep3 *self, uint8_t const *packet, ui
         endpoint->on_write(
             self,
             &token,
-            &self->buffers->incoming_request[SEP3_PAYLOAD_OFFSET],
+            payload,
             payload_size,
             true,
             endpoint->on_write_user);
@@ -691,6 +755,7 @@ static int sep3__start_request(
     struct Sep3 *self,
     Sep3PacketType type,
     DataId data_id,
+    uint32_t timeout_ms,
     uint8_t const *data,
     uint16_t data_size,
     Sep3RequestCallback callback,
@@ -699,7 +764,7 @@ static int sep3__start_request(
     TransactionId transaction_id = 0;
     int rc = 0;
 
-    if ((NULL == self) || (NULL == callback)) {
+    if ((NULL == self) || (NULL == callback) || (0U == timeout_ms)) {
         return ER_INVAL;
     }
     if (self->outgoing.active) {
@@ -726,6 +791,7 @@ static int sep3__start_request(
     self->outgoing.transaction_id = transaction_id;
     self->outgoing.data_id = data_id;
     self->outgoing.generation = self->token_generation;
+    self->outgoing.timeout_ms = timeout_ms;
     self->outgoing.callback = callback;
     self->outgoing.callback_user = user;
 
@@ -762,8 +828,6 @@ int sep3__init(struct Sep3 *self, struct Sep3Config const *config)
         (NULL == config) ||
         (NULL == config->buffers) ||
         (NULL == config->transmit) ||
-        (0 == config->request_timeout_ms) ||
-        (0 == config->incoming_request_timeout_ms) ||
         (0 == config->token_epoch) ||
         ((0 != config->endpoint_capacity) && (NULL == config->endpoints))) {
         return ER_INVAL;
@@ -778,8 +842,6 @@ int sep3__init(struct Sep3 *self, struct Sep3Config const *config)
     self->buffers = config->buffers;
     self->endpoints = config->endpoints;
     self->endpoint_capacity = config->endpoint_capacity;
-    self->request_timeout_ms = config->request_timeout_ms;
-    self->incoming_request_timeout_ms = config->incoming_request_timeout_ms;
     self->token_epoch = config->token_epoch;
     self->retry_count = config->retry_count;
     self->transmit = config->transmit;
@@ -796,12 +858,13 @@ int sep3__init(struct Sep3 *self, struct Sep3Config const *config)
 int sep3__register_read_handler(
     struct Sep3 *self,
     DataId data_id,
+    uint32_t incoming_request_timeout_ms,
     Sep3ReadHandler handler,
     void *user)
 {
     struct Sep3Endpoint *endpoint = NULL;
 
-    if ((NULL == self) || (NULL == handler)) {
+    if ((NULL == self) || (NULL == handler) || (0U == incoming_request_timeout_ms)) {
         return ER_INVAL;
     }
     if (data_id >= SEP3_RESERVED_DATA_ID_START) {
@@ -816,19 +879,21 @@ int sep3__register_read_handler(
     }
     endpoint->on_read = handler;
     endpoint->on_read_user = user;
+    endpoint->read_timeout_ms = incoming_request_timeout_ms;
     return 0;
 }
 
 int sep3__register_write_handler(
     struct Sep3 *self,
     DataId data_id,
+    uint32_t incoming_request_timeout_ms,
     bool allow_write_no_answer,
     Sep3WriteHandler handler,
     void *user)
 {
     struct Sep3Endpoint *endpoint = NULL;
 
-    if ((NULL == self) || (NULL == handler)) {
+    if ((NULL == self) || (NULL == handler) || (0U == incoming_request_timeout_ms)) {
         return ER_INVAL;
     }
     if (data_id >= SEP3_RESERVED_DATA_ID_START) {
@@ -844,6 +909,7 @@ int sep3__register_write_handler(
     endpoint->on_write = handler;
     endpoint->on_write_user = user;
     endpoint->allow_write_no_answer = allow_write_no_answer;
+    endpoint->write_timeout_ms = incoming_request_timeout_ms;
     return 0;
 }
 
@@ -981,7 +1047,7 @@ int sep3__process(struct Sep3 *self, uint64_t now_ms)
     }
 
     if (self->incoming.active &&
-        ((now_ms - self->incoming.started_ms) >= self->incoming_request_timeout_ms)) {
+        ((now_ms - self->incoming.started_ms) >= self->incoming.timeout_ms)) {
         self->incoming.active = false;
         self->incoming.has_answer = false;
         self->incoming.answer_pending = false;
@@ -989,7 +1055,7 @@ int sep3__process(struct Sep3 *self, uint64_t now_ms)
 
     if (self->outgoing.active &&
         self->outgoing.timeout_started &&
-        ((now_ms - self->outgoing.timeout_started_ms) >= self->request_timeout_ms)) {
+        ((now_ms - self->outgoing.timeout_started_ms) >= self->outgoing.timeout_ms)) {
         if (self->outgoing.retries_done >= self->retry_count) {
             sep3__finish_outgoing_error(self, ER_TIMEDOUT);
         } else {
@@ -1015,6 +1081,7 @@ int sep3__process(struct Sep3 *self, uint64_t now_ms)
 int sep3__read(
     struct Sep3 *self,
     DataId data_id,
+    uint32_t timeout_ms,
     Sep3RequestCallback callback,
     void *user)
 {
@@ -1022,6 +1089,7 @@ int sep3__read(
         self,
         SEP3_PACKET_READ,
         data_id,
+        timeout_ms,
         NULL,
         0,
         callback,
@@ -1031,6 +1099,7 @@ int sep3__read(
 int sep3__write(
     struct Sep3 *self,
     DataId data_id,
+    uint32_t timeout_ms,
     uint8_t const *data,
     uint16_t data_size,
     Sep3RequestCallback callback,
@@ -1040,6 +1109,7 @@ int sep3__write(
         self,
         SEP3_PACKET_WRITE,
         data_id,
+        timeout_ms,
         data,
         data_size,
         callback,
@@ -1052,7 +1122,8 @@ int sep3__write_no_answer(
     uint8_t const *data,
     uint16_t data_size)
 {
-    uint8_t packet[SEP3_MAX_PACKET_SIZE] = {0};
+    uint8_t slot_id = 0;
+    struct Sep3TxSlot *slot = NULL;
     uint16_t packet_size = 0;
     int rc = 0;
 
@@ -1062,8 +1133,20 @@ int sep3__write_no_answer(
     if (data_id >= SEP3_RESERVED_DATA_ID_START) {
         return ER_NOT_PERM;
     }
+    if (data_size > SEP3_MAX_PAYLOAD_SIZE) {
+        return ER_OVERFLOW;
+    }
+    if ((0 != data_size) && (NULL == data)) {
+        return ER_INVAL;
+    }
+
+    slot = sep3__reserve_tx_slot(self, &slot_id);
+    if (NULL == slot) {
+        return ER_AGAIN;
+    }
+
     rc = sep3__build_packet(
-        packet,
+        slot->data,
         SEP3_PACKET_WRITE_NO_ANSWER,
         0,
         data_id,
@@ -1073,9 +1156,9 @@ int sep3__write_no_answer(
     if (0 != rc) {
         return rc;
     }
-    return sep3__queue_packet(
+    return sep3__commit_tx_slot(
         self,
-        packet,
+        slot,
         packet_size,
         SEP3_TX_PURPOSE_UNACKNOWLEDGED,
         0,
@@ -1126,8 +1209,9 @@ int sep3__send_error_answer(
     uint8_t error_code,
     char const *message)
 {
-    uint8_t payload[SEP3_MAX_PAYLOAD_SIZE] = {0};
+    uint8_t *packet = NULL;
     uint16_t message_size = 0;
+    uint16_t packet_size = 0;
 
     if ((NULL == self) || (NULL == token)) {
         return ER_INVAL;
@@ -1143,15 +1227,22 @@ int sep3__send_error_answer(
         }
         ++message_size;
     }
-
-    payload[0] = error_code;
-    if (0 != message_size) {
-        memcpy(&payload[1], message, message_size);
+    if (!sep3__token_is_valid(self, token)) {
+        return ER_INVAL;
     }
-    return sep3__set_incoming_answer(
-        self,
-        token,
+
+    packet = self->buffers->incoming_answer;
+    packet_size = (uint16_t)(SEP3_MIN_PACKET_SIZE + 1U + message_size);
+    sep3__write_packet_header(
+        packet,
         SEP3_PACKET_APP_ERROR_ANSWER,
-        payload,
-        (uint16_t)(1U + message_size));
+        token->transaction_id,
+        token->data_id);
+    packet[SEP3_PAYLOAD_OFFSET] = error_code;
+    if (0 != message_size) {
+        memmove(&packet[SEP3_PAYLOAD_OFFSET + 1U], message, message_size);
+    }
+    sep3__finalize_packet(packet, packet_size, &self->incoming.answer_size);
+
+    return sep3__commit_incoming_answer(self);
 }

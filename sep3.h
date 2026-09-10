@@ -14,13 +14,26 @@
 extern "C" {
 #endif
 
+#if defined(CONFIG_SEP3_MAX_PAYLOAD_SIZE)
+#define SEP3_PAYLOAD_SIZE_CONFIG (CONFIG_SEP3_MAX_PAYLOAD_SIZE)
+#else
+#define SEP3_PAYLOAD_SIZE_CONFIG (244)
+#endif
+
+#if (SEP3_PAYLOAD_SIZE_CONFIG < 64) || (SEP3_PAYLOAD_SIZE_CONFIG > 2046)
+#error "SEP3 payload size must be in range 64..2046"
+#endif
+
 enum {
-    SEP3_MAX_PAYLOAD_SIZE = 244,
-    SEP3_MAX_PACKET_SIZE = 250,
-    SEP3_MAX_ENCODED_BODY_SIZE = 286,
-    SEP3_MAX_ENCODED_FRAME_SIZE = 288,
-    SEP3_TX_SLOT_COUNT = 2,
+    SEP3_MAX_PAYLOAD_SIZE = SEP3_PAYLOAD_SIZE_CONFIG,
+    SEP3_PACKET_OVERHEAD_SIZE = 8,
+    SEP3_TX_SLOT_COUNT = 1,
+    SEP3_MAX_PACKET_SIZE = SEP3_MAX_PAYLOAD_SIZE + SEP3_PACKET_OVERHEAD_SIZE,
+    SEP3_MAX_ENCODED_FRAME_SIZE = FRAMER7B_FRAME_SIZE(SEP3_MAX_PACKET_SIZE),
+    SEP3_MAX_ENCODED_BODY_SIZE = SEP3_MAX_ENCODED_FRAME_SIZE - 2,
 };
+
+#undef SEP3_PAYLOAD_SIZE_CONFIG
 
 typedef uint8_t DataId;
 typedef uint16_t TransactionId;
@@ -104,6 +117,8 @@ typedef struct Sep3Endpoint {
     DataId data_id;
     bool is_used;
     bool allow_write_no_answer;
+    uint32_t read_timeout_ms;
+    uint32_t write_timeout_ms;
     Sep3ReadHandler on_read;
     void *on_read_user;
     Sep3WriteHandler on_write;
@@ -121,9 +136,7 @@ typedef struct Sep3TxSlot {
 typedef struct Sep3Buffers {
     uint8_t rx[SEP3_MAX_ENCODED_BODY_SIZE];
     uint8_t outgoing_packet[SEP3_MAX_PACKET_SIZE];
-    uint8_t incoming_request[SEP3_MAX_PACKET_SIZE];
     uint8_t incoming_answer[SEP3_MAX_PACKET_SIZE];
-    uint8_t transient_answer[SEP3_MAX_PACKET_SIZE];
     struct Sep3TxSlot tx[SEP3_TX_SLOT_COUNT];
 } Sep3Buffers;
 
@@ -131,8 +144,6 @@ typedef struct Sep3Config {
     struct Sep3Buffers *buffers;
     struct Sep3Endpoint *endpoints;
     uint16_t endpoint_capacity;
-    uint32_t request_timeout_ms;
-    uint32_t incoming_request_timeout_ms;
     uint32_t token_epoch;
     uint8_t retry_count;
     Sep3TransmitHandler transmit;
@@ -147,6 +158,7 @@ typedef struct Sep3OutgoingTransaction {
     DataId data_id;
     uint16_t packet_size;
     uint32_t generation;
+    uint32_t timeout_ms;
     uint8_t retries_done;
     uint64_t timeout_started_ms;
     Sep3RequestCallback callback;
@@ -164,6 +176,8 @@ typedef struct Sep3IncomingTransaction {
     uint16_t request_size;
     uint16_t answer_size;
     uint32_t generation;
+    uint32_t payload_hash;
+    uint32_t timeout_ms;
     uint64_t started_ms;
 } Sep3IncomingTransaction;
 
@@ -172,9 +186,6 @@ typedef struct Sep3 {
     struct Sep3Buffers *buffers;
     struct Sep3Endpoint *endpoints;
     uint16_t endpoint_capacity;
-    uint16_t endpoint_count;
-    uint32_t request_timeout_ms;
-    uint32_t incoming_request_timeout_ms;
     uint8_t retry_count;
     Sep3TransmitHandler transmit;
     void *transmit_user;
@@ -184,14 +195,16 @@ typedef struct Sep3 {
     uint64_t now_ms;
     uint32_t token_epoch;
     uint32_t token_generation;
-    uint16_t transient_answer_size;
+    TransactionId transient_transaction_id;
     uint16_t rx_encoded_size;
     uint8_t rx_last_encoded_byte;
     uint8_t tx_head;
     uint8_t tx_count;
+    DataId transient_data_id;
+    Sep3ProtocolError transient_error;
     bool rx_frame_started;
     bool handling_received;
-    bool transient_answer_pending;
+    bool transient_error_pending;
     bool time_initialized;
 } Sep3;
 
@@ -203,17 +216,19 @@ typedef struct Sep3 {
  */
 int sep3__init(struct Sep3 *self, struct Sep3Config const *config);
 
-/** Register a READ handler for data_id. Registration lasts until sep3__init(). */
+/** Register a READ handler and its incoming response timeout for data_id. */
 int sep3__register_read_handler(
     struct Sep3 *self,
     DataId data_id,
+    uint32_t incoming_request_timeout_ms,
     Sep3ReadHandler handler,
     void *user);
 
-/** Register a WRITE handler for data_id. */
+/** Register a WRITE handler and incoming response timeout for data_id. */
 int sep3__register_write_handler(
     struct Sep3 *self,
     DataId data_id,
+    uint32_t incoming_request_timeout_ms,
     bool allow_write_no_answer,
     Sep3WriteHandler handler,
     void *user);
@@ -238,17 +253,19 @@ int sep3__handle_transmitted(
 /** Process timers and retry queued transport submissions. */
 int sep3__process(struct Sep3 *self, uint64_t now_ms);
 
-/** Start an asynchronous READ transaction. */
+/** Start an asynchronous READ transaction with timeout_ms for answer retries. */
 int sep3__read(
     struct Sep3 *self,
     DataId data_id,
+    uint32_t timeout_ms,
     Sep3RequestCallback callback,
     void *user);
 
-/** Start an asynchronous WRITE transaction. */
+/** Start an asynchronous WRITE transaction with timeout_ms for answer retries. */
 int sep3__write(
     struct Sep3 *self,
     DataId data_id,
+    uint32_t timeout_ms,
     uint8_t const *data,
     uint16_t data_size,
     Sep3RequestCallback callback,

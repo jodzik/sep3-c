@@ -301,6 +301,14 @@ int sep3__send_error_answer(
     uint8_t error_code,
     char const *message);
 
+/** Return the maximum payload size this core translation unit was compiled with.
+ *
+ * Every translation unit of the core, the platform wrappers and the application
+ * must be built with the same CONFIG_SEP3_MAX_PAYLOAD_SIZE, otherwise the buffer
+ * layouts differ. A platform wrapper can compare its own value against this one.
+ */
+uint16_t sep3__max_payload_size(void);
+
 #ifdef __cplusplus
 }
 #endif

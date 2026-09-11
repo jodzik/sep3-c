@@ -867,9 +867,6 @@ int sep3__register_read_handler(
     if ((NULL == self) || (NULL == handler) || (0U == incoming_request_timeout_ms)) {
         return ER_INVAL;
     }
-    if (data_id >= SEP3_RESERVED_DATA_ID_START) {
-        return ER_NOT_PERM;
-    }
     endpoint = sep3__get_or_create_endpoint(self, data_id);
     if (NULL == endpoint) {
         return ER_NO_MEM;
@@ -895,9 +892,6 @@ int sep3__register_write_handler(
 
     if ((NULL == self) || (NULL == handler) || (0U == incoming_request_timeout_ms)) {
         return ER_INVAL;
-    }
-    if (data_id >= SEP3_RESERVED_DATA_ID_START) {
-        return ER_NOT_PERM;
     }
     endpoint = sep3__get_or_create_endpoint(self, data_id);
     if (NULL == endpoint) {
@@ -1245,4 +1239,9 @@ int sep3__send_error_answer(
     sep3__finalize_packet(packet, packet_size, &self->incoming.answer_size);
 
     return sep3__commit_incoming_answer(self);
+}
+
+uint16_t sep3__max_payload_size(void)
+{
+    return (uint16_t)SEP3_MAX_PAYLOAD_SIZE;
 }
